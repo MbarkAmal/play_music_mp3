@@ -24,7 +24,9 @@ class MusicService : Service() {
         const val CHANNEL_ID = "music_channel_id"
         const val ACTION_PLAY = "action_play"
         const val ACTION_PAUSE = "action_pause"
+        const val ACTION_RESUME = "action_resume"
         const val ACTION_STOP = "action_stop"
+        const val ACTION_QUERY_STATUS = "action_query_status"
         const val ACTION_STATUS_CHANGE = "com.example.play_music_app.STATUS_CHANGE"
     }
 
@@ -57,39 +59,70 @@ class MusicService : Service() {
         when (intent?.action) {
             ACTION_PLAY -> {
                 val musicResId = intent.getIntExtra("MUSIC_ID", -1)
-                playMusic(musicResId)
+                val localPath = intent.getStringExtra("LOCAL_PATH")
+                val title = intent.getStringExtra("SONG_TITLE") ?: "Music Player"
+                playMusic(musicResId, localPath, title)
             }
             ACTION_PAUSE -> {
                 pauseMusic()
             }
+            ACTION_RESUME -> {
+                resumeMusic()
+            }
             ACTION_STOP -> {
                 stopMusic()
             }
+            ACTION_QUERY_STATUS -> {
+                broadcastStatus()
+            }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
-    private fun playMusic(resId: Int) {
-        if (resId != -1) {
-            // New song requested
+    private var currentTrackTitle: String? = null
+
+    private fun playMusic(resId: Int, localPath: String?, title: String) {
+        try {
+            currentTrackTitle = title
             mediaPlayer?.release()
-            mediaPlayer = MediaPlayer.create(this, resId)
-            mediaPlayer?.isLooping = true
-            mediaPlayer?.start()
-        } else {
-            // Resume existing
-            mediaPlayer?.start()
+            mediaPlayer = MediaPlayer().apply {
+                if (localPath != null) {
+                    setDataSource(localPath)
+                } else if (resId != -1) {
+                    val afd = resources.openRawResourceFd(resId)
+                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                    afd.close()
+                } else {
+                    return
+                }
+                prepare()
+                isLooping = false // Let OnCompletion handle it if we want custom behavior, or keep true for loop
+                setOnCompletionListener {
+                    updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
+                    updateNotification(isPlaying = false, title = currentTrackTitle ?: "Music Player")
+                }
+                start()
+            }
+            updateNotification(isPlaying = true, title = title)
+            updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
-        
-        updateNotification(isPlaying = true)
-        updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+    }
+
+    private fun resumeMusic() {
+        if (mediaPlayer != null && !mediaPlayer!!.isPlaying) {
+            mediaPlayer?.start()
+            updateNotification(isPlaying = true, title = currentTrackTitle ?: "Music Player")
+            updatePlaybackState(PlaybackStateCompat.STATE_PLAYING)
+        }
     }
 
     private fun pauseMusic() {
         if (mediaPlayer?.isPlaying == true) {
             mediaPlayer?.pause()
         }
-        updateNotification(isPlaying = false)
+        updateNotification(isPlaying = false, title = currentTrackTitle ?: "Music Player")
         updatePlaybackState(PlaybackStateCompat.STATE_PAUSED)
     }
 
@@ -97,17 +130,22 @@ class MusicService : Service() {
         mediaPlayer?.stop()
         mediaPlayer?.release()
         mediaPlayer = null
+        currentTrackTitle = null
         updatePlaybackState(PlaybackStateCompat.STATE_STOPPED)
         mediaSession.isActive = false
-        mediaSession.release()
         
-        // Broadcast stopped state
-        val statusIntent = Intent(ACTION_STATUS_CHANGE)
-        statusIntent.putExtra("IS_PLAYING", false)
-        sendBroadcast(statusIntent)
+        broadcastStatus()
 
         stopForeground(true)
         stopSelf()
+    }
+
+    private fun broadcastStatus() {
+        val statusIntent = Intent(ACTION_STATUS_CHANGE).apply {
+            putExtra("IS_PLAYING", mediaPlayer?.isPlaying == true)
+            putExtra("SONG_TITLE", currentTrackTitle)
+        }
+        sendBroadcast(statusIntent)
     }
 
     private fun updatePlaybackState(state: Int) {
@@ -122,11 +160,9 @@ class MusicService : Service() {
         mediaSession.setPlaybackState(playbackState)
     }
 
-    private fun updateNotification(isPlaying: Boolean) {
+    private fun updateNotification(isPlaying: Boolean, title: String) {
         // Broadcast status to UI
-        val statusIntent = Intent(ACTION_STATUS_CHANGE)
-        statusIntent.putExtra("IS_PLAYING", isPlaying)
-        sendBroadcast(statusIntent)
+        broadcastStatus()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -154,28 +190,36 @@ class MusicService : Service() {
         )
 
         val notificationBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground) // Ensure this exists, or use a system icon
-            .setContentTitle("Music Player")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(title)
             .setContentText(if (isPlaying) "Playing" else "Paused")
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setStyle(
                 MediaStyle()
                     .setMediaSession(mediaSession.sessionToken)
-                    .setShowActionsInCompactView(0, 1) // Indexes of actions to show
+                    .setShowActionsInCompactView(0)
             )
             .addAction(
                 if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
                 if (isPlaying) "Pause" else "Play",
                 if (isPlaying) pausePendingIntent else playPendingIntent
             )
-            .addAction(android.R.drawable.ic_media_next, "Stop", stopPendingIntent) // Using 'next' icon as stop generic if needed, or clear
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopPendingIntent)
             .setOngoing(isPlaying)
 
-        // For older versions, we might need a distinct icon for Stop if ic_media_stop isn't readily available in android.R.drawable without newer API checks, 
-        // but typically android.R.drawable.ic_media_pause/play exist. 
-        // Let's use standard android drawables.
-
-        startForeground(1, notificationBuilder.build())
+        if (isPlaying) {
+            startForeground(1, notificationBuilder.build())
+        } else {
+            // Keep notification visible but allow dismissal if user wants
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(1, notificationBuilder.build())
+            // Remove foreground status but NOT the notification
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_DETACH)
+            } else {
+                stopForeground(false)
+            }
+        }
     }
 
     override fun onDestroy() {
